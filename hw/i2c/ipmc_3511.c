@@ -3,12 +3,12 @@
  *
  *  LCR Embedded systems
  */
-
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
 #include "migration/vmstate.h"
 #include "qemu/bcd.h"
 #include "qom/object.h"
+#include "qemu/log.h"
 #include "system/rtc.h"
 #include "trace.h"
 
@@ -22,6 +22,10 @@
 #define HOURS_12   0x40
 #define HOURS_PM   0x20
 #define CTRL_OSF   0x20
+
+static uint8_t g_val = 0xff;
+
+static FILE *g_debugFile = NULL;
 
 #define TYPE_IPMC3511 "ipmc3511"
 OBJECT_DECLARE_SIMPLE_TYPE(IPMC3511State, IPMC3511)
@@ -94,6 +98,8 @@ static void inc_regptr(IPMC3511State *s)
 static int ipmc3511_event(I2CSlave *i2c, enum i2c_event event)
 {
     IPMC3511State *s = IPMC3511(i2c);
+    fprintf(g_debugFile, "ipmc3511_event. i2c:%p \n", i2c);
+    fflush(g_debugFile);
 
     switch (event) {
     case I2C_START_RECV:
@@ -121,17 +127,21 @@ static uint8_t ipmc3511_recv(I2CSlave *i2c)
 
     res  = s->nvram[s->ptr];
 
-    //trace_ipmc3511_recv(s->ptr, res);
-
     inc_regptr(s);
-    return res;
+    res = g_val;
+    (void)res;
+    fprintf(g_debugFile, "ipmc3511_recv. i2c:%p res:0x%x g_val:0x%x\n", i2c, res, g_val);
+    fflush(g_debugFile);
+    return g_val;
 }
 
 static int ipmc3511_send(I2CSlave *i2c, uint8_t data)
 {
     IPMC3511State *s = IPMC3511(i2c);
 
-    //trace_ipmc3511_send(s->ptr, data);
+    fprintf(g_debugFile, "ipmc3511_send. i2c:%p data:0x%x g_val:0x%x\n", i2c, data, g_val);
+    fflush(g_debugFile);
+    g_val = data;
 
     if (s->addr_byte) {
         s->ptr = data & (NVRAM_SIZE - 1);
@@ -206,6 +216,9 @@ static void ipmc3511_reset(DeviceState *dev)
 {
     IPMC3511State *s = IPMC3511(dev);
 
+    fprintf(g_debugFile, "ipmc3511_reset. dev:%p\n", dev);
+    fflush(g_debugFile);
+
     /* The clock is running and synchronized with the host */
     s->offset = 0;
     s->wday_offset = 0;
@@ -224,6 +237,8 @@ static void ipmc3511_class_init(ObjectClass *klass, void *data)
     k->send = ipmc3511_send;
     device_class_set_legacy_reset(dc, ipmc3511_reset);
     dc->vmsd = &vmstate_ipmc3511;
+
+    g_debugFile = fopen("ipmc3511.log","w");
 }
 
 static const TypeInfo ipmc3511_types[] = {
