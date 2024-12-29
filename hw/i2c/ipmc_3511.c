@@ -244,8 +244,12 @@ static void ipmc3511_init(IPMC3511State *s)
 static void ipmc3511_reset(DeviceState *dev)
 {
     IPMC3511State *s = IPMC3511(dev);
+    fprintf(g_debugFile, "ipmc3511_reset\n");
+    fflush(g_debugFile);
 
-    ipmc3511_init(s); 
+    ipmc3511_init(s);
+    fprintf(g_debugFile, "<===ipmc3511_reset\n");
+    fflush(g_debugFile);
 }
 
 static void ipmc3511_realize(DeviceState *dev, Error **errp)
@@ -284,6 +288,8 @@ static void ipmc3511_class_init(ObjectClass *klass, void *data)
      * This is the debug logging
      */
     g_debugFile = fopen("ipmc3511.log","w");
+    fprintf(g_debugFile, "ipmc3511_class_init\n");
+    fflush(g_debugFile);
 }
 
 static const TypeInfo ipmc3511_types[] = {
