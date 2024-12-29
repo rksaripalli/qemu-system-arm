@@ -161,6 +161,8 @@ static void process_ipmi_message(IPMC3511State *s)
 static int ipmc3511_event(I2CSlave *i2c, enum i2c_event event)
 {
     IPMC3511State *s = IPMC3511(i2c);
+    fprintf(g_debugFile, "ipmc3511_event\n");
+    fflush(g_debugFile);
     switch (event) {
         case I2C_START_SEND:
             // Master is starting to send data
@@ -196,6 +198,8 @@ static int ipmc3511_event(I2CSlave *i2c, enum i2c_event event)
         case I2C_START_SEND_ASYNC:
             break;
     }
+    fprintf(g_debugFile, "ipmc3511_event\n");
+    fflush(g_debugFile);
     return 0; 
 }
 
@@ -259,10 +263,10 @@ static void ipmc3511_realize(DeviceState *dev, Error **errp)
 }
 
 static const VMStateDescription vmstate_ipmc3511 = {
-    .name = TYPE_IPMC3511,
-    .version_id = 1,
+    .name = "ipmc3511",
+    .version_id = 2,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_I2C_SLAVE(parent_obj, IPMC3511State),
         VMSTATE_UINT8(fru_state, IPMC3511State),
         VMSTATE_UINT8(ipmb_state, IPMC3511State),
