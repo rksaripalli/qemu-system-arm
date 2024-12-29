@@ -2,6 +2,9 @@
  * 3511 IPMC on i2c
  *
  *  LCR Embedded systems
+ *  This code handles IPMI over IPMB protocol
+ *  and implements the commands specified in the
+ *  3511 specification
  */
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
@@ -11,6 +14,28 @@
 #include "qemu/log.h"
 #include "system/rtc.h"
 #include "trace.h"
+
+// IPMI message format constants
+#define IPMI_HEADER_SIZE     6  // Bytes before data
+#define IPMI_CHECKSUM_SIZE   1  // Size of each checksum
+#define MAX_IPMI_MSG_SIZE    256 
+
+// IPMI Network Functions
+#define NETFN_APP            0x06
+#define NETFN_STORAGE        0x0A
+#define NETFN_SENSOR_EVENT   0x04
+#define NETFN_OEM           0x2E
+
+// IPMI Commands
+#define CMD_GET_DEVICE_ID    0x01
+#define CMD_GET_SELF_TEST    0x04
+#define CMD_GET_ACPI_POWER   0x07
+
+// Completion Codes
+#define CC_OK               0x00
+#define CC_INVALID_CMD     0xC1
+#define CC_LENGTH_ERROR    0xC7
+#define CC_PARAM_ERROR     0xC9
 
 /* Size of NVRAM including both the user-accessible area and the
  * secondary register area.
@@ -23,8 +48,6 @@
 #define HOURS_PM   0x20
 #define CTRL_OSF   0x20
 
-static uint8_t g_val = 0xff;
-
 static FILE *g_debugFile = NULL;
 
 #define TYPE_IPMC3511 "ipmc3511"
@@ -33,211 +56,233 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPMC3511State, IPMC3511)
 struct IPMC3511State {
     I2CSlave parent_obj;
 
-    int64_t offset;
-    uint8_t wday_offset;
-    uint8_t nvram[NVRAM_SIZE];
-    int32_t ptr;
-    bool addr_byte;
+    // Message handling state
+    uint8_t rx_buffer[MAX_IPMI_MSG_SIZE];  // Buffer for receiving message
+    uint8_t tx_buffer[MAX_IPMI_MSG_SIZE];  // Buffer for transmitting response
+    uint16_t rx_count;    // Number of bytes received
+    uint16_t tx_count;    // Number of bytes to transmit
+    uint16_t tx_pos;      // Current position in tx buffer
+    bool receiving;       // Currently receiving a message
+    bool transmitting;    // Currently transmitting a response
+
+    // Device state
+    uint8_t fru_state;
+    uint8_t ipmb_state;
+    uint8_t sensors[8];
+
+    // VITA 46.11 state
+    struct {
+        uint8_t version_major;
+        uint8_t version_minor;
+        uint8_t capabilities;
+    } vita; 
 };
 
-static const VMStateDescription vmstate_ipmc3511 = {
-    .name = "ipmc3511",
-    .version_id = 2,
-    .minimum_version_id = 1,
-    .fields = (const VMStateField[]) {
-        VMSTATE_I2C_SLAVE(parent_obj, IPMC3511State),
-        VMSTATE_INT64(offset, IPMC3511State),
-        VMSTATE_UINT8_V(wday_offset, IPMC3511State, 2),
-        VMSTATE_UINT8_ARRAY(nvram, IPMC3511State, NVRAM_SIZE),
-        VMSTATE_INT32(ptr, IPMC3511State),
-        VMSTATE_BOOL(addr_byte, IPMC3511State),
-        VMSTATE_END_OF_LIST()
+// Calculate IPMI checksum
+static uint8_t calculate_checksum(uint8_t *data, size_t length) {
+    uint8_t sum = 0;
+    for (size_t i = 0; i < length; i++) {
+        sum += data[i];
     }
-};
-
-static void capture_current_time(IPMC3511State *s)
-{
-    /* Capture the current time into the secondary registers
-     * which will be actually read by the data transfer operation.
-     */
-    struct tm now;
-    qemu_get_timedate(&now, s->offset);
-    s->nvram[0] = to_bcd(now.tm_sec);
-    s->nvram[1] = to_bcd(now.tm_min);
-    if (s->nvram[2] & HOURS_12) {
-        int tmp = now.tm_hour;
-        if (tmp % 12 == 0) {
-            tmp += 12;
-        }
-        if (tmp <= 12) {
-            s->nvram[2] = HOURS_12 | to_bcd(tmp);
-        } else {
-            s->nvram[2] = HOURS_12 | HOURS_PM | to_bcd(tmp - 12);
-        }
-    } else {
-        s->nvram[2] = to_bcd(now.tm_hour);
-    }
-    s->nvram[3] = (now.tm_wday + s->wday_offset) % 7 + 1;
-    s->nvram[4] = to_bcd(now.tm_mday);
-    s->nvram[5] = to_bcd(now.tm_mon + 1);
-    s->nvram[6] = to_bcd(now.tm_year - 100);
+    return -sum;
 }
 
-static void inc_regptr(IPMC3511State *s)
+// Process received IPMI message and prepare response
+static void process_ipmi_message(IPMC3511State *s)
 {
-    /* The register pointer wraps around after 0x3F; wraparound
-     * causes the current time/date to be retransferred into
-     * the secondary registers.
-     */
-    s->ptr = (s->ptr + 1) & (NVRAM_SIZE - 1);
-    if (!s->ptr) {
-        capture_current_time(s);
+    if (s->rx_count < IPMI_HEADER_SIZE + IPMI_CHECKSUM_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR, "IPMC: Message too short\n");
+        return;
     }
+
+    // Verify first checksum (bytes 0-1)
+    uint8_t checksum1 = calculate_checksum(s->rx_buffer, 2);
+    if (checksum1 != s->rx_buffer[2]) {
+        qemu_log_mask(LOG_GUEST_ERROR, "IPMC: Header checksum error\n");
+        return;
+    }
+
+    // Extract message fields
+    uint8_t netfn = (s->rx_buffer[1] >> 2) & 0x3F;
+    uint8_t rqLun = s->rx_buffer[1] & 0x03;
+    uint8_t rqSA = s->rx_buffer[3];
+    uint8_t rqSeq = s->rx_buffer[4];
+    uint8_t cmd = s->rx_buffer[5];
+
+    // Prepare response header
+    s->tx_buffer[0] = rqSA;                      // Requester becomes responder
+    s->tx_buffer[1] = ((netfn + 1) << 2) | rqLun; // Response NetFn
+    s->tx_buffer[2] = 0;                         // Checksum 1 (calculated later)
+    s->tx_buffer[3] = s->rx_buffer[0];          // Original responder's address
+    s->tx_buffer[4] = rqSeq;                    // Original sequence number
+    s->tx_buffer[5] = cmd;                      // Original command
+    s->tx_buffer[6] = 0x00;                     // Completion code
+
+    s->tx_count = 7;  // Start with header + completion code
+
+    // Handle commands
+    switch (netfn) {
+        case NETFN_APP:  // App NetFn
+            switch (cmd) {
+                case CMD_GET_DEVICE_ID:
+                    s->tx_buffer[7] = 0x00;      // Device ID
+                    s->tx_buffer[8] = 0x02;      // Device revision
+                    s->tx_buffer[9] = 0x82;      // Firmware revision 1
+                    s->tx_buffer[10] = 0x3C;     // Firmware revision 2
+                    s->tx_buffer[11] = 0x02;     // IPMI version
+                    s->tx_buffer[12] = 0xBF;     // Additional device support
+                    s->tx_buffer[13] = 0x28;     // Manufacturer ID LSB (Abaco)
+                    s->tx_buffer[14] = 0x08;     // Manufacturer ID
+                    s->tx_buffer[15] = 0x00;     // Manufacturer ID MSB
+                    s->tx_count = 16;
+                    break;
+
+                case CMD_GET_SELF_TEST:
+                    s->tx_buffer[7] = 0x55;      // Self test pass
+                    s->tx_buffer[8] = 0x00;      // No errors
+                    s->tx_count = 9;
+                    break;
+            }
+            break;
+    }
+
+    // Calculate checksums
+    s->tx_buffer[2] = calculate_checksum(s->tx_buffer, 2);
+    s->tx_buffer[s->tx_count] = calculate_checksum(&s->tx_buffer[3], s->tx_count - 3);
+    s->tx_count++;
+
+    // Prepare for transmitting response
+    s->tx_pos = 0;
+    s->transmitting = true;
+
+    qemu_log_mask(LOG_UNIMP, "IPMC: Processed message NetFn=0x%02x Cmd=0x%02x\n", netfn, cmd);
 }
 
 static int ipmc3511_event(I2CSlave *i2c, enum i2c_event event)
 {
     IPMC3511State *s = IPMC3511(i2c);
-    fprintf(g_debugFile, "ipmc3511_event. i2c:%p \n", i2c);
-    fflush(g_debugFile);
-
     switch (event) {
-    case I2C_START_RECV:
-        /* In h/w, capture happens on any START condition, not just a
-         * START_RECV, but there is no need to actually capture on
-         * START_SEND, because the guest can't get at that data
-         * without going through a START_RECV which would overwrite it.
-         */
-        capture_current_time(s);
-        break;
-    case I2C_START_SEND:
-        s->addr_byte = true;
-        break;
-    default:
-        break;
-    }
+        case I2C_START_SEND:
+            // Master is starting to send data
+            s->rx_count = 0;
+            s->receiving = true;
+            s->transmitting = false;
+            break;
 
-    return 0;
+        case I2C_START_RECV:
+            // Master is starting to receive data
+            s->tx_pos = 0;
+            s->receiving = false;
+            if (!s->transmitting) {
+                // If we're not already transmitting a response,
+                // process the received message
+                process_ipmi_message(s);
+            }
+            break;
+
+        case I2C_FINISH:
+            // End of transaction
+            if (s->receiving && s->rx_count > 0) {
+                // Process message if we were receiving
+                process_ipmi_message(s);
+            }
+            s->receiving = false;
+            s->transmitting = false;
+            break;
+
+        case I2C_NACK:
+            break;
+
+        case I2C_START_SEND_ASYNC:
+            break;
+    }
+    return 0; 
 }
 
 static uint8_t ipmc3511_recv(I2CSlave *i2c)
 {
     IPMC3511State *s = IPMC3511(i2c);
-    uint8_t res;
 
-    res  = s->nvram[s->ptr];
-
-    inc_regptr(s);
-    res = g_val;
-    (void)res;
-    fprintf(g_debugFile, "ipmc3511_recv. i2c:%p res:0x%x g_val:0x%x\n", i2c, res, g_val);
-    fflush(g_debugFile);
-    return g_val;
+    if (s->transmitting && s->tx_pos < s->tx_count) {
+        return s->tx_buffer[s->tx_pos++];
+    }
+    return 0xff;
 }
 
 static int ipmc3511_send(I2CSlave *i2c, uint8_t data)
 {
     IPMC3511State *s = IPMC3511(i2c);
 
-    fprintf(g_debugFile, "ipmc3511_send. i2c:%p data:0x%x g_val:0x%x\n", i2c, data, g_val);
-    fflush(g_debugFile);
-    g_val = data;
-
-    if (s->addr_byte) {
-        s->ptr = data & (NVRAM_SIZE - 1);
-        s->addr_byte = false;
-        return 0;
+    if (s->receiving && s->rx_count < MAX_IPMI_MSG_SIZE) {
+        s->rx_buffer[s->rx_count++] = data;
     }
-    if (s->ptr < 7) {
-        /* Time register. */
-        struct tm now;
-        qemu_get_timedate(&now, s->offset);
-        switch(s->ptr) {
-        case 0:
-            /* TODO: Implement CH (stop) bit.  */
-            now.tm_sec = from_bcd(data & 0x7f);
-            break;
-        case 1:
-            now.tm_min = from_bcd(data & 0x7f);
-            break;
-        case 2:
-            if (data & HOURS_12) {
-                int tmp = from_bcd(data & (HOURS_PM - 1));
-                if (data & HOURS_PM) {
-                    tmp += 12;
-                }
-                if (tmp % 12 == 0) {
-                    tmp -= 12;
-                }
-                now.tm_hour = tmp;
-            } else {
-                now.tm_hour = from_bcd(data & (HOURS_12 - 1));
-            }
-            break;
-        case 3:
-            {
-                /* The day field is supposed to contain a value in
-                   the range 1-7. Otherwise behavior is undefined.
-                 */
-                int user_wday = (data & 7) - 1;
-                s->wday_offset = (user_wday - now.tm_wday + 7) % 7;
-            }
-            break;
-        case 4:
-            now.tm_mday = from_bcd(data & 0x3f);
-            break;
-        case 5:
-            now.tm_mon = from_bcd(data & 0x1f) - 1;
-            break;
-        case 6:
-            now.tm_year = from_bcd(data) + 100;
-            break;
-        }
-        s->offset = qemu_timedate_diff(&now);
-    } else if (s->ptr == 7) {
-        /* Control register. */
-
-        /* Ensure bits 2, 3 and 6 will read back as zero. */
-        data &= 0xB3;
-
-        /* Attempting to write the OSF flag to logic 1 leaves the
-           value unchanged. */
-        data = (data & ~CTRL_OSF) | (data & s->nvram[s->ptr] & CTRL_OSF);
-
-        s->nvram[s->ptr] = data;
-    } else {
-        s->nvram[s->ptr] = data;
-    }
-    inc_regptr(s);
     return 0;
 }
+
+// Initialize device state
+static void ipmc3511_init(IPMC3511State *s)
+{
+    memset(s, 0, sizeof(*s));
+    s->fru_state = 0x01;        // M1 - Deactivated
+    s->ipmb_state = 0x01;       // Enabled
+
+    // Initialize sensors
+    s->sensors[0] = 0xF0;  // VSO_FRU_STATE
+    s->sensors[1] = 0xF1;  // VSO_IPMB_LINK
+    s->sensors[2] = 0xF2;  // VSO_FRU_HEALTH
+    s->sensors[3] = 0x02;  // VSO_VOLTAGE
+    s->sensors[4] = 0xF3;  // VSO_TEMPERATURE
+    s->sensors[5] = 0xF4;  // VSO_PAYLOAD_TEST
+    s->sensors[6] = 0xF5;  // VSO_PAYLOAD_STATUS
+    s->sensors[7] = 0xF6;  // FRU_MODE_SENSOR
+
+    s->vita.version_major = 0x01;
+    s->vita.version_minor = 0x00;
+    s->vita.capabilities = 0x03;  // Tier 2 capabilities
+} 
 
 static void ipmc3511_reset(DeviceState *dev)
 {
     IPMC3511State *s = IPMC3511(dev);
 
-    fprintf(g_debugFile, "ipmc3511_reset. dev:%p\n", dev);
-    fflush(g_debugFile);
-
-    /* The clock is running and synchronized with the host */
-    s->offset = 0;
-    s->wday_offset = 0;
-    memset(s->nvram, 0, NVRAM_SIZE);
-    s->ptr = 0;
-    s->addr_byte = false;
+    ipmc3511_init(s); 
 }
+
+static void ipmc3511_realize(DeviceState *dev, Error **errp)
+{
+	IPMC3511State *s = IPMC3511(dev);
+    ipmc3511_init(s);
+}
+
+static const VMStateDescription vmstate_ipmc3511 = {
+    .name = TYPE_IPMC3511,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_I2C_SLAVE(parent_obj, IPMC3511State),
+        VMSTATE_UINT8(fru_state, IPMC3511State),
+        VMSTATE_UINT8(ipmb_state, IPMC3511State),
+        VMSTATE_UINT8_ARRAY(sensors, IPMC3511State, 8),
+        VMSTATE_END_OF_LIST()
+    }
+}; 
 
 static void ipmc3511_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
 
+    dc->realize = ipmc3511_realize;
     k->event = ipmc3511_event;
     k->recv = ipmc3511_recv;
     k->send = ipmc3511_send;
     device_class_set_legacy_reset(dc, ipmc3511_reset);
     dc->vmsd = &vmstate_ipmc3511;
 
+    /*
+     * Open a file to log.
+     * This is the debug logging
+     */
     g_debugFile = fopen("ipmc3511.log","w");
 }
 
