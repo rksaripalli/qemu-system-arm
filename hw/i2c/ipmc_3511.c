@@ -75,7 +75,7 @@ struct IPMC3511State {
         uint8_t version_major;
         uint8_t version_minor;
         uint8_t capabilities;
-    } vita; 
+    } vita;
 };
 
 // Calculate IPMI checksum
@@ -90,6 +90,8 @@ static uint8_t calculate_checksum(uint8_t *data, size_t length) {
 // Process received IPMI message and prepare response
 static void process_ipmi_message(IPMC3511State *s)
 {
+    fprintf(g_debugFile, "process_ipmi_message\n");
+    fflush(g_debugFile);
     if (s->rx_count < IPMI_HEADER_SIZE + IPMI_CHECKSUM_SIZE) {
         qemu_log_mask(LOG_GUEST_ERROR, "IPMC: Message too short\n");
         return;
@@ -207,6 +209,9 @@ static uint8_t ipmc3511_recv(I2CSlave *i2c)
 {
     IPMC3511State *s = IPMC3511(i2c);
 
+    fprintf(g_debugFile, "ipmc3511_recv\n");
+    fflush(g_debugFile);
+
     if (s->transmitting && s->tx_pos < s->tx_count) {
         return s->tx_buffer[s->tx_pos++];
     }
@@ -217,16 +222,19 @@ static int ipmc3511_send(I2CSlave *i2c, uint8_t data)
 {
     IPMC3511State *s = IPMC3511(i2c);
 
+    fprintf(g_debugFile, "ipmc3511_send\n");
+    fflush(g_debugFile);
+
     if (s->receiving && s->rx_count < MAX_IPMI_MSG_SIZE) {
         s->rx_buffer[s->rx_count++] = data;
     }
     return 0;
 }
 
+
 // Initialize device state
 static void ipmc3511_init(IPMC3511State *s)
 {
-    memset(s, 0, sizeof(*s));
     s->fru_state = 0x01;        // M1 - Deactivated
     s->ipmb_state = 0x01;       // Enabled
 
@@ -243,7 +251,7 @@ static void ipmc3511_init(IPMC3511State *s)
     s->vita.version_major = 0x01;
     s->vita.version_minor = 0x00;
     s->vita.capabilities = 0x03;  // Tier 2 capabilities
-} 
+}
 
 static void ipmc3511_reset(DeviceState *dev)
 {
@@ -259,7 +267,11 @@ static void ipmc3511_reset(DeviceState *dev)
 static void ipmc3511_realize(DeviceState *dev, Error **errp)
 {
 	IPMC3511State *s = IPMC3511(dev);
+    fprintf(g_debugFile, "ipmc3511_realize\n");
+    fflush(g_debugFile);
     ipmc3511_init(s);
+    fprintf(g_debugFile, "ipmc3511_realize\n");
+    fflush(g_debugFile);
 }
 
 static const VMStateDescription vmstate_ipmc3511 = {
