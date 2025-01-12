@@ -5,6 +5,10 @@
  *  This code handles IPMI over IPMB protocol
  *  and implements the commands specified in the
  *  3511 specification
+ *  This is an emulation layer
+ * 
+ *  [Version 1.0] implements get device id and
+ *  get vso capabilities for now
  */
 #include "qemu/osdep.h"
 #include "hw/i2c/i2c.h"
@@ -14,6 +18,7 @@
 #include "qemu/log.h"
 #include "system/rtc.h"
 #include "trace.h"
+#include "qemu/timer.h"
 
 // IPMI message format constants
 #define IPMI_HEADER_SIZE     6  // Bytes before data
@@ -53,21 +58,32 @@ static FILE *g_debugFile = NULL;
 #define TYPE_IPMC3511 "ipmc3511"
 OBJECT_DECLARE_SIMPLE_TYPE(IPMC3511State, IPMC3511)
 
+//various states of the IPMB state machine
+//I2C_START_SEND is sent as event when master sends
+// START condition followed by device address with
+// write bit 0
+// This is when the device starts getting data
+typedef enum {
+    IPMB_STATE_IDLE,
+    IPMB_STATE_RECEIVING,
+    IPMB_STATE_SENDING
+} IPMBState;
+
 struct IPMC3511State {
     I2CSlave parent_obj;
 
     // Message handling state
     uint8_t rx_buffer[MAX_IPMI_MSG_SIZE];  // Buffer for receiving message
     uint8_t tx_buffer[MAX_IPMI_MSG_SIZE];  // Buffer for transmitting response
-    uint16_t rx_count;    // Number of bytes received
-    uint16_t tx_count;    // Number of bytes to transmit
+    uint16_t rx_len;    // Number of bytes received
+    uint16_t tx_len;    // Number of bytes to transmit
     uint16_t tx_pos;      // Current position in tx buffer
-    bool receiving;       // Currently receiving a message
-    bool transmitting;    // Currently transmitting a response
+    bool tx_overflow;  // Flag to track overflow
+    bool rx_overflow;  // Flag to track overflow
 
     // Device state
     uint8_t fru_state;
-    uint8_t ipmb_state;
+    IPMBState ipmb_state;
     uint8_t sensors[8];
 
     // VITA 46.11 state
@@ -78,155 +94,236 @@ struct IPMC3511State {
     } vita;
 };
 
-// Calculate IPMI checksum
-static uint8_t calculate_checksum(uint8_t *data, size_t length) {
+static void reset_buffers(IPMC3511State *dev) {
+    fprintf(g_debugFile, "Resetting buffers\n");
+    fflush(g_debugFile);
+
+    // Reset receive
+    dev->rx_len = 0;
+    dev->rx_overflow = false;
+    memset(dev->rx_buffer, 0, MAX_IPMI_MSG_SIZE);
+
+    // Reset transmit
+    dev->tx_len = 0;
+    dev->tx_pos = 0;
+    dev->tx_overflow = false;
+    memset(dev->tx_buffer, 0, MAX_IPMI_MSG_SIZE);
+}
+
+// Command Handlers
+static void handle_get_device_id(IPMC3511State *dev, 
+                               uint8_t *request, uint8_t req_len,
+                               uint8_t *response, uint8_t *resp_len) 
+{
+    fprintf(g_debugFile, "handle_get_device_id");
+    fflush(g_debugFile);
+
+    response[0] = 0x00;     // Completion Code
+    response[1] = 0x20;     // Device ID
+    response[2] = 0x80;     // Device Revision
+    response[3] = 0x02;     // Firmware Rev 1
+    response[4] = 0x00;     // Firmware Rev 2
+    response[5] = 0x02;     // IPMI Version 2.0
+    response[6] = 0x1F;     // Device Support
+    response[7] = 0x00;     // Manufacturer ID [7:0]
+    response[8] = 0x00;     // Manufacturer ID [15:8]
+    response[9] = 0x00;     // Manufacturer ID [23:16]
+    response[10] = 0x00;    // Product ID [7:0]
+    response[11] = 0x00;    // Product ID [15:8]
+
+    *resp_len = 12;
+}
+
+static void handle_get_vso_capabilities(IPMC3511State *dev,
+                                      uint8_t *request, uint8_t req_len,
+                                      uint8_t *response, uint8_t *resp_len)
+{
+    fprintf(g_debugFile, "handle_get_vso_capabilities");
+    fflush(g_debugFile);
+
+    response[0] = 0x00;     // Completion Code
+    response[1] = 0x03;     // VITA Group Extension
+    response[2] = 0x01;     // VSO Specification Rev
+    response[3] = 0xFF;     // Reserved
+    response[4] = 0x00;     // Reserved
+
+    *resp_len = 5;
+}
+
+// IPMI Command Handler function type
+typedef void (*IPMICommandHandler)(IPMC3511State *dev, 
+                                 uint8_t *request, uint8_t req_len,
+                                 uint8_t *response, uint8_t *resp_len);
+
+typedef struct {
+    uint8_t netfn;
+    uint8_t cmd;
+    uint8_t group_ext;  // 0xFF means no group extension
+    IPMICommandHandler handler;
+} IPMICommandEntry;
+
+
+// Command Table
+// Handler function for each type of ipmi command
+// sent over ipmb
+static const IPMICommandEntry command_table[] = {
+    {0x06, 0x01, 0xFF, handle_get_device_id},        // Get Device ID
+    {0x2C, 0x00, 0x03, handle_get_vso_capabilities}, // Get VSO Capabilities
+    {0x00, 0x00, 0x00, NULL}                         // End marker
+};
+
+static uint8_t calculate_checksum(uint8_t *data, int length) {
     uint8_t sum = 0;
-    for (size_t i = 0; i < length; i++) {
+    for (int i = 0; i < length; i++) {
         sum += data[i];
     }
     return -sum;
 }
 
-// Process received IPMI message and prepare response
-static void process_ipmi_message(IPMC3511State *s)
-{
-    fprintf(g_debugFile, "process_ipmi_message\n");
+// process a full ipmi request
+static void process_ipmi_request(IPMC3511State *dev) {
+    uint8_t netfn = dev->rx_buffer[0] >> 2;
+    uint8_t cmd = dev->rx_buffer[4];
+    uint8_t *request_data = &dev->rx_buffer[6];
+    uint8_t request_len = dev->rx_len - 7;  // Exclude header and checksum
+    uint8_t group_ext = 0xFF;
+
+    fprintf(g_debugFile, "PIPMIREQ: netfn:%d request_len:%d\n", netfn, request_len);
     fflush(g_debugFile);
-    if (s->rx_count < IPMI_HEADER_SIZE + IPMI_CHECKSUM_SIZE) {
-        qemu_log_mask(LOG_GUEST_ERROR, "IPMC: Message too short\n");
-        return;
+
+    // If it's a group extension command, get the group ID
+    if (netfn == 0x2C && request_len > 0) {
+        group_ext = request_data[0];
+        request_data++;
+        request_len--;
     }
 
-    // Verify first checksum (bytes 0-1)
-    uint8_t checksum1 = calculate_checksum(s->rx_buffer, 2);
-    if (checksum1 != s->rx_buffer[2]) {
-        qemu_log_mask(LOG_GUEST_ERROR, "IPMC: Header checksum error\n");
-        return;
-    }
+    // Find matching command handler
+    const IPMICommandEntry *entry = command_table;
+    while (entry->handler != NULL) {
+        fprintf(g_debugFile, "walk: entry:%d:%d:%d netfn:%d cmd:%d group_ext:%d\n",
+                entry->netfn, entry->cmd, entry->group_ext, netfn, cmd, group_ext);
+        if (entry->netfn == netfn && entry->cmd == cmd &&
+            (entry->group_ext == 0xFF || entry->group_ext == group_ext)) {
+            
+            uint8_t response_data[256];
+            uint8_t response_len = 0;
 
-    // Extract message fields
-    uint8_t netfn = (s->rx_buffer[1] >> 2) & 0x3F;
-    uint8_t rqLun = s->rx_buffer[1] & 0x03;
-    uint8_t rqSA = s->rx_buffer[3];
-    uint8_t rqSeq = s->rx_buffer[4];
-    uint8_t cmd = s->rx_buffer[5];
+            // Call command handler
+            entry->handler(dev, request_data, request_len,
+                         response_data, &response_len);
 
-    // Prepare response header
-    s->tx_buffer[0] = rqSA;                      // Requester becomes responder
-    s->tx_buffer[1] = ((netfn + 1) << 2) | rqLun; // Response NetFn
-    s->tx_buffer[2] = 0;                         // Checksum 1 (calculated later)
-    s->tx_buffer[3] = s->rx_buffer[0];          // Original responder's address
-    s->tx_buffer[4] = rqSeq;                    // Original sequence number
-    s->tx_buffer[5] = cmd;                      // Original command
-    s->tx_buffer[6] = 0x00;                     // Completion code
+            // Build IPMB response packet
+            dev->tx_buffer[0] = dev->rx_buffer[2];    // rqSA
+            dev->tx_buffer[1] = ((netfn + 1) << 2);   // rqNetFn + 1
+            dev->tx_buffer[2] = 0;                    // Checksum 1
+            dev->tx_buffer[3] = 0x20;                 // rsSA (BMC)
+            dev->tx_buffer[4] = dev->rx_buffer[4];    // Sequence
+            dev->tx_buffer[5] = cmd;                  // Command
 
-    s->tx_count = 7;  // Start with header + completion code
+            // Add response data
+            memcpy(&dev->tx_buffer[6], response_data, response_len);
+            dev->tx_len = response_len + 6;
 
-    // Handle commands
-    switch (netfn) {
-        case NETFN_APP:  // App NetFn
-            switch (cmd) {
-                case CMD_GET_DEVICE_ID:
-                    s->tx_buffer[7] = 0x00;      // Device ID
-                    s->tx_buffer[8] = 0x02;      // Device revision
-                    s->tx_buffer[9] = 0x82;      // Firmware revision 1
-                    s->tx_buffer[10] = 0x3C;     // Firmware revision 2
-                    s->tx_buffer[11] = 0x02;     // IPMI version
-                    s->tx_buffer[12] = 0xBF;     // Additional device support
-                    s->tx_buffer[13] = 0x28;     // Manufacturer ID LSB (Abaco)
-                    s->tx_buffer[14] = 0x08;     // Manufacturer ID
-                    s->tx_buffer[15] = 0x00;     // Manufacturer ID MSB
-                    s->tx_count = 16;
-                    break;
+            // Calculate checksums
+            dev->tx_buffer[2] = calculate_checksum(dev->tx_buffer, 2);
+            dev->tx_buffer[dev->tx_len] = 
+                calculate_checksum(&dev->tx_buffer[3], dev->tx_len - 3);
+            dev->tx_len++;
 
-                case CMD_GET_SELF_TEST:
-                    s->tx_buffer[7] = 0x55;      // Self test pass
-                    s->tx_buffer[8] = 0x00;      // No errors
-                    s->tx_count = 9;
-                    break;
-            }
+            dev->tx_pos = 0;
+            dev->ipmb_state = IPMB_STATE_SENDING;
             break;
+        }
+        entry++;
     }
-
-    // Calculate checksums
-    s->tx_buffer[2] = calculate_checksum(s->tx_buffer, 2);
-    s->tx_buffer[s->tx_count] = calculate_checksum(&s->tx_buffer[3], s->tx_count - 3);
-    s->tx_count++;
-
-    // Prepare for transmitting response
-    s->tx_pos = 0;
-    s->transmitting = true;
-
-    qemu_log_mask(LOG_UNIMP, "IPMC: Processed message NetFn=0x%02x Cmd=0x%02x\n", netfn, cmd);
 }
 
 static int ipmc3511_event(I2CSlave *i2c, enum i2c_event event)
 {
-    IPMC3511State *s = IPMC3511(i2c);
-    fprintf(g_debugFile, "ipmc3511_event\n");
+    IPMC3511State *dev = IPMC3511(i2c);
+
+    fprintf(g_debugFile, "ipmc3511_event. event:%d ipmb_state:%d\n", event, dev->ipmb_state);
     fflush(g_debugFile);
+
     switch (event) {
-        case I2C_START_SEND:
-            // Master is starting to send data
-            s->rx_count = 0;
-            s->receiving = true;
-            s->transmitting = false;
-            break;
-
-        case I2C_START_RECV:
-            // Master is starting to receive data
-            s->tx_pos = 0;
-            s->receiving = false;
-            if (!s->transmitting) {
-                // If we're not already transmitting a response,
-                // process the received message
-                process_ipmi_message(s);
+    case I2C_START_SEND:
+    case I2C_START_SEND_ASYNC:
+        fprintf(g_debugFile, "I2C_START_SEND\n");
+        fflush(g_debugFile);
+        reset_buffers(dev);  // Reset buffers on new transaction
+        dev->ipmb_state = IPMB_STATE_RECEIVING;
+        break;
+    
+    case I2C_START_RECV:
+        fprintf(g_debugFile, "I2C_START_RECV\n");
+        fflush(g_debugFile);
+        if (dev->ipmb_state == IPMB_STATE_RECEIVING) {
+            if (!dev->rx_overflow) {
+                process_ipmi_request(dev);
             }
-            break;
-
-        case I2C_FINISH:
-            // End of transaction
-            if (s->receiving && s->rx_count > 0) {
-                // Process message if we were receiving
-                process_ipmi_message(s);
-            }
-            s->receiving = false;
-            s->transmitting = false;
-            break;
-
-        case I2C_NACK:
-            break;
-
-        case I2C_START_SEND_ASYNC:
-            break;
+            dev->ipmb_state = IPMB_STATE_SENDING;
+        }
+        break;
+    
+    case I2C_FINISH:
+        fprintf(g_debugFile, "I2C_FINISH\n");
+        fflush(g_debugFile);
+        if (dev->tx_overflow || dev->rx_overflow) {
+            reset_buffers(dev);
+        }
+        if (dev->ipmb_state != IPMB_STATE_SENDING) {
+            dev->ipmb_state = IPMB_STATE_IDLE;
+        }
+        break;
+    case I2C_NACK:
+        fprintf(g_debugFile, "I2C_NACK\n");
+        fflush(g_debugFile);
+        // Handle NACK - typically means receiver isn't ready
+        // Could reset state or implement retry logic
+        dev->ipmb_state = IPMB_STATE_IDLE;
+        break;
     }
-    fprintf(g_debugFile, "ipmc3511_event\n");
-    fflush(g_debugFile);
-    return 0; 
+    return 0;
 }
 
 static uint8_t ipmc3511_recv(I2CSlave *i2c)
 {
-    IPMC3511State *s = IPMC3511(i2c);
+    IPMC3511State *dev = IPMC3511(i2c);
+    uint8_t data = 0xFF;
 
-    fprintf(g_debugFile, "ipmc3511_recv\n");
+    if (dev->ipmb_state == IPMB_STATE_SENDING) {
+        if (dev->tx_pos < dev->tx_len && dev->tx_len <= MAX_IPMI_MSG_SIZE) {
+            data = dev->tx_buffer[dev->tx_pos++];
+        } else if (dev->tx_len > MAX_IPMI_MSG_SIZE) {
+            dev->tx_overflow = true;
+            fprintf(g_debugFile, "TX buffer overflow!\n");
+            fflush(g_debugFile);
+        }
+    }
+
+    fprintf(g_debugFile, "ipmc3511_tx. data:0x%x tx_pos:%d tx_len:%d\n", 
+            data, dev->tx_pos, dev->tx_len);
     fflush(g_debugFile);
 
-    if (s->transmitting && s->tx_pos < s->tx_count) {
-        return s->tx_buffer[s->tx_pos++];
-    }
-    return 0xff;
+    return data;
 }
 
 static int ipmc3511_send(I2CSlave *i2c, uint8_t data)
 {
-    IPMC3511State *s = IPMC3511(i2c);
+    IPMC3511State *dev = IPMC3511(i2c);
 
-    fprintf(g_debugFile, "ipmc3511_send\n");
+    fprintf(g_debugFile, "ipmc3511_rx. data:0x%x rx_len:%d\n", data, dev->rx_len);
     fflush(g_debugFile);
 
-    if (s->receiving && s->rx_count < MAX_IPMI_MSG_SIZE) {
-        s->rx_buffer[s->rx_count++] = data;
+    if (dev->ipmb_state == IPMB_STATE_RECEIVING) {
+        if (dev->rx_len < MAX_IPMI_MSG_SIZE) {
+            dev->rx_buffer[dev->rx_len++] = data;
+        } else {
+            dev->rx_overflow = true;
+            fprintf(g_debugFile, "RX buffer overflow!\n");
+            fflush(g_debugFile);
+        }
     }
     return 0;
 }
@@ -267,10 +364,10 @@ static void ipmc3511_reset(DeviceState *dev)
 static void ipmc3511_realize(DeviceState *dev, Error **errp)
 {
 	IPMC3511State *s = IPMC3511(dev);
-    fprintf(g_debugFile, "ipmc3511_realize\n");
+    fprintf(g_debugFile, "==>ipmc3511_realize\n");
     fflush(g_debugFile);
     ipmc3511_init(s);
-    fprintf(g_debugFile, "ipmc3511_realize\n");
+    fprintf(g_debugFile, "<===ipmc3511_realize\n");
     fflush(g_debugFile);
 }
 
@@ -281,7 +378,6 @@ static const VMStateDescription vmstate_ipmc3511 = {
     .fields = (const VMStateField[]) {
         VMSTATE_I2C_SLAVE(parent_obj, IPMC3511State),
         VMSTATE_UINT8(fru_state, IPMC3511State),
-        VMSTATE_UINT8(ipmb_state, IPMC3511State),
         VMSTATE_UINT8_ARRAY(sensors, IPMC3511State, 8),
         VMSTATE_END_OF_LIST()
     }
