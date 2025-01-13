@@ -80,6 +80,7 @@ struct IPMC3511State {
     uint16_t tx_pos;      // Current position in tx buffer
     bool tx_overflow;  // Flag to track overflow
     bool rx_overflow;  // Flag to track overflow
+    uint8_t i2c_slave_address;
 
     // Device state
     uint8_t fru_state;
@@ -181,16 +182,40 @@ static uint8_t calculate_checksum(uint8_t *data, int length) {
 
 // process a full ipmi request
 static void process_ipmi_request(IPMC3511State *dev) {
-    uint8_t netfn = dev->rx_buffer[0] >> 2;
-    uint8_t cmd = dev->rx_buffer[4];
-    uint8_t *request_data = &dev->rx_buffer[6];
-    uint8_t request_len = dev->rx_len - 7;  // Exclude header and checksum
-    uint8_t group_ext = 0xFF;
-
-    fprintf(g_debugFile, "PIPMIREQ: netfn:%d request_len:%d\n", netfn, request_len);
+    fprintf(g_debugFile, "Processing IPMI request, rx_len=%d\n", dev->rx_len);
     fflush(g_debugFile);
 
-    // If it's a group extension command, get the group ID
+    // Check minimum length (7 bytes: rsSA, NetFn/LUN, csum1, rqSA, rqSeq/LUN, cmd, csum2)
+    if (dev->rx_len < 7) {
+        fprintf(g_debugFile, "Request too short: %d bytes\n", dev->rx_len);
+        fflush(g_debugFile);
+        return;
+    }
+
+    // Extract responder's Slave Address and verify it's for us
+    uint8_t rsSA = dev->rx_buffer[0];              // Responder's Slave Address
+    if (rsSA != dev->i2c_slave_address) {  // Our I2C address
+        fprintf(g_debugFile, "Request not for us. Expected %d, got 0x%02x\n", dev->i2c_slave_address, rsSA);
+        fflush(g_debugFile);
+        return;
+    }
+    uint8_t netfn = (dev->rx_buffer[1] >> 2);      // NetFn from byte 1 bits 7:2
+    uint8_t rsLUN = dev->rx_buffer[1] & 0x03;      // Responder LUN from byte 1 bits 1:0
+    uint8_t rqSA = dev->rx_buffer[3];              // Requester's Slave Address
+    uint8_t rqSeq = dev->rx_buffer[4] >> 2;        // Requester's Sequence Number
+    uint8_t rqLUN = dev->rx_buffer[4] & 0x03;      // Requester's LUN
+    uint8_t cmd = dev->rx_buffer[5];               // Command
+    
+    fprintf(g_debugFile, "IPMI Request: rsSA=0x%02x, NetFn=0x%02x, Cmd=0x%02x\n",
+            rsSA, netfn, cmd);
+    fprintf(g_debugFile, "rqSA=0x%02x, rqSeq=0x%02x\n", rqSA, rqSeq);
+    fflush(g_debugFile);
+
+    uint8_t group_ext = 0xFF;
+    uint8_t *request_data = &dev->rx_buffer[6];
+    uint8_t request_len = dev->rx_len - 7;  // Excluding header and checksum
+
+    // For Group Extension commands (NetFn 0x2C), get the group extension
     if (netfn == 0x2C && request_len > 0) {
         group_ext = request_data[0];
         request_data++;
@@ -200,8 +225,8 @@ static void process_ipmi_request(IPMC3511State *dev) {
     // Find matching command handler
     const IPMICommandEntry *entry = command_table;
     while (entry->handler != NULL) {
-        fprintf(g_debugFile, "walk: entry:%d:%d:%d netfn:%d cmd:%d group_ext:%d\n",
-                entry->netfn, entry->cmd, entry->group_ext, netfn, cmd, group_ext);
+        fprintf(g_debugFile, "Checking handler: NetFn=0x%02x, Cmd=0x%02x, GroupExt=0x%02x\n",
+                entry->netfn, entry->cmd, entry->group_ext);
         if (entry->netfn == netfn && entry->cmd == cmd &&
             (entry->group_ext == 0xFF || entry->group_ext == group_ext)) {
             
@@ -213,12 +238,12 @@ static void process_ipmi_request(IPMC3511State *dev) {
                          response_data, &response_len);
 
             // Build IPMB response packet
-            dev->tx_buffer[0] = dev->rx_buffer[2];    // rqSA
-            dev->tx_buffer[1] = ((netfn + 1) << 2);   // rqNetFn + 1
-            dev->tx_buffer[2] = 0;                    // Checksum 1
-            dev->tx_buffer[3] = 0x20;                 // rsSA (BMC)
-            dev->tx_buffer[4] = dev->rx_buffer[4];    // Sequence
-            dev->tx_buffer[5] = cmd;                  // Command
+            dev->tx_buffer[0] = rqSA;                     // Requester's SA
+            dev->tx_buffer[1] = ((netfn + 1) << 2) | rqLUN;  // NetFn + 1, original LUN
+            dev->tx_buffer[2] = 0;                        // Checksum 1 (calculated below)
+            dev->tx_buffer[3] = rsSA;                     // Responder's SA
+            dev->tx_buffer[4] = (rqSeq << 2) | rsLUN;    // Original sequence number and LUN
+            dev->tx_buffer[5] = cmd;                      // Command
 
             // Add response data
             memcpy(&dev->tx_buffer[6], response_data, response_len);
@@ -389,6 +414,7 @@ static void ipmc3511_realize(DeviceState *dev, Error **errp)
 	IPMC3511State *s = IPMC3511(dev);
     fprintf(g_debugFile, "==>ipmc3511_realize\n");
     fflush(g_debugFile);
+    s->i2c_slave_address = 0x40;
     ipmc3511_init(s);
     fprintf(g_debugFile, "<===ipmc3511_realize\n");
     fflush(g_debugFile);
