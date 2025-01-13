@@ -95,19 +95,18 @@ struct IPMC3511State {
 };
 
 static void reset_buffers(IPMC3511State *dev) {
-    fprintf(g_debugFile, "Resetting buffers\n");
+    fprintf(g_debugFile, "reset_buffers: Resetting all buffers\n");
     fflush(g_debugFile);
 
-    // Reset receive
+    // Reset receive buffer
+    memset(dev->rx_buffer, 0, sizeof(dev->rx_buffer));
     dev->rx_len = 0;
     dev->rx_overflow = false;
-    memset(dev->rx_buffer, 0, MAX_IPMI_MSG_SIZE);
 
-    // Reset transmit
+    // Reset transmit buffer
+    memset(dev->tx_buffer, 0, sizeof(dev->tx_buffer));
     dev->tx_len = 0;
     dev->tx_pos = 0;
-    dev->tx_overflow = false;
-    memset(dev->tx_buffer, 0, MAX_IPMI_MSG_SIZE);
 }
 
 // Command Handlers
@@ -243,15 +242,16 @@ static int ipmc3511_event(I2CSlave *i2c, enum i2c_event event)
 {
     IPMC3511State *dev = IPMC3511(i2c);
 
-    fprintf(g_debugFile, "ipmc3511_event. event:%d ipmb_state:%d\n", event, dev->ipmb_state);
+    fprintf(g_debugFile, "ipmc3511_event: event=%d, state=%d\n", event, dev->ipmb_state);
     fflush(g_debugFile);
 
     switch (event) {
     case I2C_START_SEND:
     case I2C_START_SEND_ASYNC:
-        fprintf(g_debugFile, "I2C_START_SEND\n");
+        fprintf(g_debugFile, "I2C_START_SEND/ASYNC\n");
         fflush(g_debugFile);
-        reset_buffers(dev);  // Reset buffers on new transaction
+        // Reset buffers for new transaction
+        reset_buffers(dev);
         dev->ipmb_state = IPMB_STATE_RECEIVING;
         break;
     
@@ -263,49 +263,65 @@ static int ipmc3511_event(I2CSlave *i2c, enum i2c_event event)
                 process_ipmi_request(dev);
             }
             dev->ipmb_state = IPMB_STATE_SENDING;
+            dev->tx_pos = 0;
         }
         break;
     
     case I2C_FINISH:
         fprintf(g_debugFile, "I2C_FINISH\n");
         fflush(g_debugFile);
-        if (dev->tx_overflow || dev->rx_overflow) {
-            reset_buffers(dev);
-        }
-        if (dev->ipmb_state != IPMB_STATE_SENDING) {
+        if (dev->ipmb_state == IPMB_STATE_RECEIVING) {
+            if (!dev->rx_overflow) {
+                process_ipmi_request(dev);
+            }
+            dev->ipmb_state = IPMB_STATE_SENDING;
+            dev->tx_pos = 0;
+        } else if (dev->ipmb_state != IPMB_STATE_SENDING) {
+            reset_buffers(dev);  // Reset buffers when going to idle
             dev->ipmb_state = IPMB_STATE_IDLE;
         }
         break;
+
     case I2C_NACK:
         fprintf(g_debugFile, "I2C_NACK\n");
         fflush(g_debugFile);
-        // Handle NACK - typically means receiver isn't ready
-        // Could reset state or implement retry logic
+        reset_buffers(dev);  // Reset buffers on NACK
         dev->ipmb_state = IPMB_STATE_IDLE;
         break;
+
+    default:
+        fprintf(g_debugFile, "Unhandled event: %d\n", event);
+        fflush(g_debugFile);
+        break;
     }
+
+    fprintf(g_debugFile, "ipmc3511_event exit: state=%d\n", dev->ipmb_state);
+    fflush(g_debugFile);
     return 0;
 }
 
 static uint8_t ipmc3511_recv(I2CSlave *i2c)
 {
     IPMC3511State *dev = IPMC3511(i2c);
-    uint8_t data = 0xFF;
+    uint8_t data = 0xFF;  // Default return if no data to send
+
+    fprintf(g_debugFile, "ipmc3511_tx: state=%d, tx_pos=%d, tx_len=%d\n", 
+            dev->ipmb_state, dev->tx_pos, dev->tx_len);
+    fflush(g_debugFile);
 
     if (dev->ipmb_state == IPMB_STATE_SENDING) {
-        if (dev->tx_pos < dev->tx_len && dev->tx_len <= MAX_IPMI_MSG_SIZE) {
+        if (dev->tx_pos < dev->tx_len) {
+            // Get next byte to send
             data = dev->tx_buffer[dev->tx_pos++];
-        } else if (dev->tx_len > MAX_IPMI_MSG_SIZE) {
-            dev->tx_overflow = true;
-            fprintf(g_debugFile, "TX buffer overflow!\n");
-            fflush(g_debugFile);
+            fprintf(g_debugFile, "Sending byte %d: 0x%02x\n", 
+                    dev->tx_pos - 1, data);
+        } else {
+            fprintf(g_debugFile, "No more data to send\n");
         }
     }
 
-    fprintf(g_debugFile, "ipmc3511_tx. data:0x%x tx_pos:%d tx_len:%d\n", 
-            data, dev->tx_pos, dev->tx_len);
+    fprintf(g_debugFile, "ipmc3511_tx exit: data=0x%02x\n", data);
     fflush(g_debugFile);
-
     return data;
 }
 
@@ -313,18 +329,25 @@ static int ipmc3511_send(I2CSlave *i2c, uint8_t data)
 {
     IPMC3511State *dev = IPMC3511(i2c);
 
-    fprintf(g_debugFile, "ipmc3511_rx. data:0x%x rx_len:%d\n", data, dev->rx_len);
+    fprintf(g_debugFile, "ipmc3511_rx: state=%d, data=0x%02x\n", 
+            dev->ipmb_state, data);
     fflush(g_debugFile);
 
     if (dev->ipmb_state == IPMB_STATE_RECEIVING) {
-        if (dev->rx_len < MAX_IPMI_MSG_SIZE) {
+        if (dev->rx_len < sizeof(dev->rx_buffer)) {
+            // Store byte in receive buffer
             dev->rx_buffer[dev->rx_len++] = data;
+            fprintf(g_debugFile, "Stored byte %d: 0x%02x\n", 
+                    dev->rx_len - 1, data);
         } else {
+            // Buffer overflow
             dev->rx_overflow = true;
             fprintf(g_debugFile, "RX buffer overflow!\n");
-            fflush(g_debugFile);
         }
     }
+
+    fprintf(g_debugFile, "ipmc3511_rx exit: rx_len=%d\n", dev->rx_len);
+    fflush(g_debugFile);
     return 0;
 }
 
