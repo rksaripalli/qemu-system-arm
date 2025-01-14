@@ -110,7 +110,10 @@ static void reset_buffers(IPMC3511State *dev) {
     dev->tx_pos = 0;
 }
 
-// Command Handlers
+// Command handler for get device id
+// The manufacturer id is from the 3511 specification
+// Response length is always 12 bytes
+// caller will provide the 2nd checksum
 static void handle_get_device_id(IPMC3511State *dev, 
                                uint8_t *request, uint8_t req_len,
                                uint8_t *response, uint8_t *resp_len) 
@@ -119,14 +122,14 @@ static void handle_get_device_id(IPMC3511State *dev,
     fflush(g_debugFile);
 
     response[0] = 0x00;     // Completion Code
-    response[1] = 0x20;     // Device ID
+    response[1] = 0x1;     // Device ID
     response[2] = 0x80;     // Device Revision
     response[3] = 0x02;     // Firmware Rev 1
     response[4] = 0x00;     // Firmware Rev 2
     response[5] = 0x02;     // IPMI Version 2.0
     response[6] = 0x1F;     // Device Support
-    response[7] = 0x00;     // Manufacturer ID [7:0]
-    response[8] = 0x00;     // Manufacturer ID [15:8]
+    response[7] = 0x28;     // Manufacturer ID [7:0]
+    response[8] = 0x08;     // Manufacturer ID [15:8]
     response[9] = 0x00;     // Manufacturer ID [23:16]
     response[10] = 0x00;    // Product ID [7:0]
     response[11] = 0x00;    // Product ID [15:8]
@@ -134,6 +137,10 @@ static void handle_get_device_id(IPMC3511State *dev,
     *resp_len = 12;
 }
 
+// Get VSO capabilities
+// for 3511 device
+// The 3511 specification does not provide the details
+// so we cooked up some values
 static void handle_get_vso_capabilities(IPMC3511State *dev,
                                       uint8_t *request, uint8_t req_len,
                                       uint8_t *response, uint8_t *resp_len)
@@ -143,11 +150,14 @@ static void handle_get_vso_capabilities(IPMC3511State *dev,
 
     response[0] = 0x00;     // Completion Code
     response[1] = 0x03;     // VITA Group Extension
-    response[2] = 0x01;     // VSO Specification Rev
-    response[3] = 0xFF;     // Reserved
-    response[4] = 0x00;     // Reserved
+    response[2] = 0x01;     // Tier 2
+    response[3] = 0;        // 1 IPMB interface. 100Khz standard mode
+    response[4] = 0x00;     // VSO standard vita 46.11
+    response[5] = 0x12;     // VSO standard revision
+    response[6] = 0x8;      // Max FRU device id
+    response[7] = 0x0;      // FRU device id for the IPM controller
 
-    *resp_len = 5;
+    *resp_len = 8; // VSO capabilities are always 8 bytes
 }
 
 // IPMI Command Handler function type
@@ -181,6 +191,13 @@ static uint8_t calculate_checksum(uint8_t *data, int length) {
 }
 
 // process a full ipmi request
+// based on the request which is in dev->rx_buffer
+// create a response. The handler must be invoked
+// based on the {netfn, cmd, group_ext} which will be
+// responsible for creating the response
+// This handler is responsible for verifying the checksums
+// in the request and creating correct checksums in the
+// response
 static void process_ipmi_request(IPMC3511State *dev) {
     fprintf(g_debugFile, "Processing IPMI request, rx_len=%d\n", dev->rx_len);
     fflush(g_debugFile);
@@ -250,6 +267,13 @@ static void process_ipmi_request(IPMC3511State *dev) {
             dev->tx_len = response_len + 6;
 
             // Calculate checksums
+            // There are 2 checksums in IPMI packet over IPMB
+            // first checksum is in byte position 3 (index 2)
+            // second one is at the end of the payload
+            // This depends on the response.
+            //  for a successful get device id response for example
+            //  the 2nd checksum is byte 19 (6 bytes + 12 bytes of
+            //  response)
             dev->tx_buffer[2] = calculate_checksum(dev->tx_buffer, 2);
             dev->tx_buffer[dev->tx_len] = 
                 calculate_checksum(&dev->tx_buffer[3], dev->tx_len - 3);
